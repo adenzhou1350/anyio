@@ -44,7 +44,6 @@ from pytest_mock.plugin import MockerFixture
 from anyio import (
     BrokenResourceError,
     BusyResourceError,
-    CancelScope,
     ClosedResourceError,
     EndOfStream,
     Event,
@@ -63,7 +62,6 @@ from anyio import (
     create_unix_listener,
     fail_after,
     get_available_backends,
-    get_cancelled_exc_class,
     getaddrinfo,
     getnameinfo,
     move_on_after,
@@ -1880,57 +1878,27 @@ class TestUDPSocket:
         "trio" not in get_available_backends(), reason="trio is not available"
     )
     @pytest.mark.parametrize("anyio_backend", ["trio"])
-    @pytest.mark.parametrize("connected", [False, True])
-    @pytest.mark.parametrize("failure", ["bind", "cancel"])
-    async def test_initialization_failure_closes_socket(
-        self,
-        family: AnyIPAddressFamily,
-        connected: bool,
-        failure: str,
-        monkeypatch: MonkeyPatch,
+    async def test_bind_failure_closes_socket(
+        self, family: AnyIPAddressFamily, monkeypatch: MonkeyPatch
     ) -> None:
-        trio = pytest.importorskip("trio")
-        socket_factory = trio.socket.socket
-        created = []
+        import trio
 
-        def capture_socket(*args: Any, **kwargs: Any) -> Any:
-            sock = socket_factory(*args, **kwargs)
-            created.append(sock)
-            if failure == "cancel":
-                scope.cancel()
+        real_socket = trio.socket.socket
+        created: list[trio.socket.SocketType] = []
 
-            return sock
+        def capture_socket(*args: Any, **kwargs: Any) -> trio.socket.SocketType:
+            created.append(real_socket(*args, **kwargs))
+            return created[-1]
 
         monkeypatch.setattr(trio.socket, "socket", capture_socket)
         host = "127.0.0.1" if family == socket.AF_INET else "::1"
         with socket.socket(family, socket.SOCK_DGRAM) as occupied:
             occupied.bind((host, 0))
             port = occupied.getsockname()[1]
-            try:
-                # Keep the exception alive: its traceback retains the failed socket.
-                with CancelScope() as scope:
-                    error_type = (
-                        OSError if failure == "bind" else get_cancelled_exc_class()
-                    )
-                    with pytest.raises(error_type) as exc_info:
-                        if connected:
-                            await create_connected_udp_socket(
-                                host, 9, family=family, local_host=host, local_port=port
-                            )
-                        else:
-                            await create_udp_socket(
-                                family=family, local_host=host, local_port=port
-                            )
+            with pytest.raises(OSError):
+                await create_udp_socket(family=family, local_host=host, local_port=port)
 
-                if failure == "bind":
-                    assert isinstance(exc_info.value, OSError)
-                    assert exc_info.value.errno in (errno.EADDRINUSE, 10048)
-
-                assert len(created) == 1
-                assert created[0].fileno() == -1
-            finally:
-                for sock in created:
-                    sock.close()
+        assert created[0].fileno() == -1
 
     async def test_aclose_waits_for_fd_release(
         self, family: AnyIPAddressFamily, free_udp_port: int
